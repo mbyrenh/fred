@@ -16,9 +16,13 @@ import java.util.Map.Entry;
 import freenet.config.InvalidConfigValueException;
 import freenet.config.SubConfig;
 import freenet.io.comm.FreenetInetAddress;
+import freenet.io.comm.Message;
 import freenet.io.comm.Peer;
 import freenet.io.comm.UdpSocketHandler;
 import freenet.l10n.NodeL10n;
+import freenet.node.events.EventDispatcher;
+import freenet.node.events.EventDispatcher.Event;
+import freenet.node.events.EventListener;
 import freenet.node.useralerts.IPUndetectedUserAlert;
 import freenet.node.useralerts.InvalidAddressOverrideUserAlert;
 import freenet.node.useralerts.SimpleUserAlert;
@@ -41,7 +45,7 @@ import freenet.support.transport.ip.IPUtil;
  * Detect the IP address of the node. Doesn't return port numbers, doesn't have access to per-port
  * information (NodeCrypto - UdpSocketHandler etc).
  */
-public class NodeIPDetector {
+public class NodeIPDetector implements EventListener {
 	private static volatile boolean logMINOR;
 	private static volatile boolean logDEBUG;
 
@@ -68,6 +72,8 @@ public class NodeIPDetector {
 	DetectedIP[] pluginDetectedIPs;
 	/** Last detected IP address */
 	FreenetInetAddress[] lastIPAddress;
+	
+	final EventDispatcher eventDispatcher;
 	
 	private class MinimumMTU {
 		
@@ -119,8 +125,9 @@ public class NodeIPDetector {
 	
 	SimpleUserAlert maybeSymmetricAlert;
 	
-	public NodeIPDetector(Node node) {
+	public NodeIPDetector(Node node, EventDispatcher eventDispatcher) {
 		this.node = node;
+		this.eventDispatcher = eventDispatcher;
 		ipDetectorManager = new IPDetectorPluginManager(node, this);
 		ipDetector = new IPAddressDetector(SECONDS.toMillis(10), this);
 		invalidAddressOverrideAlert = new InvalidAddressOverrideUserAlert(node);
@@ -128,6 +135,16 @@ public class NodeIPDetector {
 		portDetectors = new NodeIPPortDetector[0];
 	}
 
+	public void handleEvent (Event event, Object data) {
+		switch (event) {
+		case MSG_FNPDetectedIPAddress:
+		    redetectAddress();
+		break;
+		default:
+		    throw new RuntimeException("Received unknown event type: " + event);
+		}
+	}
+	
 	public synchronized void addPortDetector(NodeIPPortDetector detector) {
 		portDetectors = Arrays.copyOf(portDetectors, portDetectors.length+1);
 		portDetectors[portDetectors.length - 1] = detector;
@@ -554,6 +571,7 @@ public class NodeIPDetector {
 					detector.startARK();
 			}
 		}, SECONDS.toMillis(60));
+		eventDispatcher.subscribe(Event.MSG_FNPDetectedIPAddress, this);
 	}
 
 	public void onConnectedPeer() {

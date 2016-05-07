@@ -23,6 +23,8 @@ import freenet.keys.NodeCHK;
 import freenet.keys.NodeSSK;
 import freenet.node.NodeStats.PeerLoadStats;
 import freenet.node.NodeStats.RejectReason;
+import freenet.node.events.EventDispatcher;
+import freenet.node.events.EventDispatcher.Event;
 import freenet.node.probe.Probe;
 import freenet.store.BlockMetadata;
 import freenet.support.Fields;
@@ -30,8 +32,8 @@ import freenet.support.LogThresholdCallback;
 import freenet.support.Logger;
 import freenet.support.Logger.LogLevel;
 import freenet.support.ShortBuffer;
+import freenet.support.Tuple;
 import freenet.support.io.NativeThread;
-
 /**
  * @author amphibian
  * 
@@ -79,16 +81,18 @@ public class NodeDispatcher implements Dispatcher, Runnable {
 	private NodeStats nodeStats;
 	private NodeDispatcherCallback callback;
 	final Probe probe;
+	final EventDispatcher eventDispatcher;
 	
 	private static final long STALE_CONTEXT=20000;
 	private static final long STALE_CONTEXT_CHECK=20000;
 
-	NodeDispatcher(Node node) {
+	NodeDispatcher(Node node, EventDispatcher eventDispatcher) {
 		this.node = node;
 		this.tracker = node.tracker;
 		this.nodeStats = node.nodeStats;
 		node.getTicker().queueTimedJob(this, STALE_CONTEXT_CHECK);
 		this.probe = new Probe(node);
+		this.eventDispatcher = eventDispatcher;
 	}
 
 	ByteCounter pingCounter = new ByteCounter() {
@@ -142,7 +146,7 @@ public class NodeDispatcher implements Dispatcher, Runnable {
 		} else if(spec == DMT.FNPDetectedIPAddress) {
 			Peer p = (Peer) m.getObject(DMT.EXTERNAL_ADDRESS);
 			source.setRemoteDetectedPeer(p);
-			node.ipDetector.redetectAddress();
+			eventDispatcher.publish(EventDispatcher.Event.MSG_FNPDetectedIPAddress, m);
 			return true;
 		} else if(spec == DMT.FNPTime) {
 			return handleTime(m, source);
@@ -174,7 +178,7 @@ public class NodeDispatcher implements Dispatcher, Runnable {
 			node.nodeUpdater.uom.handleFetchDependency(m, source);
 			return true;
 		} else if(spec == DMT.FNPOpennetAnnounceRequest) {
-			return handleAnnounceRequest(m, source);
+			eventDispatcher.publish(Event.MSG_FNPOpennetAnnounceRequest, new Tuple<Message, PeerNode>(m, source));
 		} else if(spec == DMT.FNPRoutingStatus) {
 			if(source instanceof DarknetPeerNode) {
 				boolean value = m.getBoolean(DMT.ROUTING_ENABLED);
@@ -619,167 +623,7 @@ public class NodeDispatcher implements Dispatcher, Runnable {
 			node.executor.execute(rh, "CHKInsertHandler for "+id+" on "+node.getDarknetPortNumber());
 		}
 		if(logMINOR) Logger.minor(this, "Started InsertHandler for "+id);
-	}
-	
-	private boolean handleAnnounceRequest(Message m, PeerNode source) {
-		long uid = m.getLong(DMT.UID);
-		double target = m.getDouble(DMT.TARGET_LOCATION); // FIXME validate
-		short htl = (short) Math.min(m.getShort(DMT.HTL), node.maxHTL());
-		long xferUID = m.getLong(DMT.TRANSFER_UID);
-		int noderefLength = m.getInt(DMT.NODEREF_LENGTH);
-		int paddedLength = m.getInt(DMT.PADDED_LENGTH);
-
-		// Only accept a valid message. See comments at top of NodeDispatcher, but it's a good idea anyway.
-		if(target < 0.0 || target >= 1.0 || htl <= 0 || 
-				paddedLength < 0 || paddedLength > OpennetManager.MAX_OPENNET_NODEREF_LENGTH ||
-				noderefLength > paddedLength) {
-			Message msg = DMT.createFNPRejectedOverload(uid, true, false, false);
-			try {
-				source.sendAsync(msg, null, node.nodeStats.announceByteCounter);
-			} catch (NotConnectedException e) {
-				// OK
-			}
-			if(logMINOR) Logger.minor(this, "Got bogus announcement message from "+source);
-			return true;
-		}
-		
-		OpennetManager om = node.getOpennet();
-		if(om == null || !source.canAcceptAnnouncements()) {
-			if(om != null && source instanceof SeedClientPeerNode)
-				om.seedTracker.rejectedAnnounce((SeedClientPeerNode)source);
-			Message msg = DMT.createFNPOpennetDisabled(uid);
-			try {
-				source.sendAsync(msg, null, node.nodeStats.announceByteCounter);
-			} catch (NotConnectedException e) {
-				// OK
-			}
-			if(logMINOR) Logger.minor(this, "Rejected announcement (opennet or announcement disabled) from "+source);
-			return true;
-		}
-		boolean success = false;
-		try {
-			// UIDs for announcements are separate from those for requests.
-			// So we don't need to, and should not, ask Node.
-			if(!node.nodeStats.shouldAcceptAnnouncement(uid)) {
-				if(om != null && source instanceof SeedClientPeerNode)
-					om.seedTracker.rejectedAnnounce((SeedClientPeerNode)source);
-				Message msg = DMT.createFNPRejectedOverload(uid, true, false, false);
-				try {
-					source.sendAsync(msg, null, node.nodeStats.announceByteCounter);
-				} catch (NotConnectedException e) {
-					// OK
-				}
-				if(logMINOR) Logger.minor(this, "Rejected announcement (overall overload) from "+source);
-				return true;
-			}
-			if(!source.shouldAcceptAnnounce(uid)) {
-				if(om != null && source instanceof SeedClientPeerNode)
-					om.seedTracker.rejectedAnnounce((SeedClientPeerNode)source);
-				node.nodeStats.endAnnouncement(uid);
-				Message msg = DMT.createFNPRejectedOverload(uid, true, false, false);
-				try {
-					source.sendAsync(msg, null, node.nodeStats.announceByteCounter);
-				} catch (NotConnectedException e) {
-					// OK
-				}
-				if(logMINOR) Logger.minor(this, "Rejected announcement (peer limit) from "+source);
-				return true;
-			}
-			if(om != null && source instanceof SeedClientPeerNode) {
-				if(!om.seedTracker.acceptAnnounce((SeedClientPeerNode)source, node.fastWeakRandom)) {
-					node.nodeStats.endAnnouncement(uid);
-					Message msg = DMT.createFNPRejectedOverload(uid, true, false, false);
-					try {
-						source.sendAsync(msg, null, node.nodeStats.announceByteCounter);
-					} catch (NotConnectedException e) {
-						// OK
-					}
-					if(logMINOR) Logger.minor(this, "Rejected announcement (seednode limit) from "+source);
-					return true;
-				}
-			}
-			if(source instanceof SeedClientPeerNode) {
-				short maxHTL = node.maxHTL();
-				if(htl < maxHTL-1) {
-					Logger.error(this, "Announcement from seed client not at max HTL: "+htl+" for "+source);
-					htl = maxHTL;
-				}
-			}
-			AnnouncementCallback cb = null;
-			if(logMINOR) {
-				final String origin = source.toString()+" (htl "+htl+")";
-				// Log the progress of the announcement.
-				// This is similar to Announcer's logging.
-				cb = new AnnouncementCallback() {
-					private int totalAdded;
-					private int totalNotWanted;
-					private boolean acceptedSomewhere;
-					@Override
-					public synchronized void acceptedSomewhere() {
-						acceptedSomewhere = true;
-					}
-					@Override
-					public void addedNode(PeerNode pn) {
-						synchronized(this) {
-							totalAdded++;
-						}
-						Logger.minor(this, "Announcement from "+origin+" added node "+pn+(pn instanceof SeedClientPeerNode ? " (seed server added the peer directly)" : ""));
-						return;
-					}
-					@Override
-					public void bogusNoderef(String reason) {
-						Logger.minor(this, "Announcement from "+origin+" got bogus noderef: "+reason, new Exception("debug"));
-					}
-					@Override
-					public void completed() {
-						synchronized(this) {
-							Logger.minor(this, "Announcement from "+origin+" completed");
-						}
-						int shallow=node.maxHTL()-(totalAdded+totalNotWanted);
-						if(acceptedSomewhere)
-							Logger.minor(this, "Announcement from "+origin+" completed ("+totalAdded+" added, "+totalNotWanted+" not wanted, "+shallow+" shallow)");
-						else
-							Logger.minor(this, "Announcement from "+origin+" not accepted anywhere.");
-					}
-
-					@Override
-					public void nodeFailed(PeerNode pn, String reason) {
-						Logger.minor(this, "Announcement from "+origin+" failed: "+reason);
-					}
-					@Override
-					public void noMoreNodes() {
-						Logger.minor(this, "Announcement from "+origin+" ran out of nodes (route not found)");
-					}
-					@Override
-					public void nodeNotWanted() {
-						synchronized(this) {
-							totalNotWanted++;
-						}
-						Logger.minor(this, "Announcement from "+origin+" returned node not wanted for a total of "+totalNotWanted+" from this announcement)");
-					}
-					@Override
-					public void nodeNotAdded() {
-						Logger.minor(this, "Announcement from "+origin+" : node not wanted (maybe already have it, opennet just turned off, etc)");
-					}
-					@Override
-					public void relayedNoderef() {
-						synchronized(this) {
-							totalAdded++;
-							Logger.minor(this, "Announcement from "+origin+" accepted by a downstream node, relaying noderef for a total of "+totalAdded+" from this announcement)");
-						}
-					}
-				};
-			}
-			AnnounceSender sender = new AnnounceSender(target, htl, uid, source, om, node, xferUID, noderefLength, paddedLength, cb);
-			node.executor.execute(sender, "Announcement sender for "+uid);
-			success = true;
-			if(logMINOR) Logger.minor(this, "Accepted announcement from "+source);
-			return true;
-		} finally {
-			if(!success)
-				source.completedAnnounce(uid);
-		}
-	}
+	}	
 
 	final Hashtable<Long, RoutedContext> routedContexts = new Hashtable<Long, RoutedContext>();
 

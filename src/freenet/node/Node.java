@@ -104,6 +104,7 @@ import freenet.node.NodeDispatcher.NodeDispatcherCallback;
 import freenet.node.OpennetManager.ConnectionType;
 import freenet.node.SecurityLevels.NETWORK_THREAT_LEVEL;
 import freenet.node.SecurityLevels.PHYSICAL_THREAT_LEVEL;
+import freenet.node.events.EventDispatcher;
 import freenet.node.probe.Listener;
 import freenet.node.probe.Type;
 import freenet.node.stats.DataStoreInstanceType;
@@ -657,6 +658,8 @@ public class Node implements TimeSkewDetectorCallback {
 	public final Random fastWeakRandom;
 	/** The object which handles incoming messages and allows us to wait for them */
 	final MessageCore usm;
+
+	final EventDispatcher eventDispatcher;
 
 	// Darknet stuff
 
@@ -1370,8 +1373,9 @@ public class Node implements TimeSkewDetectorCallback {
 
 		usm = new MessageCore(executor);
 
+		eventDispatcher = new EventDispatcher();
 		// FIXME maybe these configs should actually be under a node.ip subconfig?
-		ipDetector = new NodeIPDetector(this);
+		ipDetector = new NodeIPDetector(this, eventDispatcher);
 		sortOrder = ipDetector.registerConfigs(nodeConfig, sortOrder);
 
 		// ARKs enabled?
@@ -1696,7 +1700,7 @@ public class Node implements TimeSkewDetectorCallback {
 		
 		tracker = new RequestTracker(peers, ticker);
 
-		usm.setDispatcher(dispatcher=new NodeDispatcher(this));
+		usm.setDispatcher(dispatcher=new NodeDispatcher(this, eventDispatcher));
 
 		uptime = new UptimeEstimator(runDir, ticker, darknetCrypto.identityHash);
 
@@ -1763,7 +1767,7 @@ public class Node implements TimeSkewDetectorCallback {
 					if(val == (opennet != null)) return;
 					if(val) {
 						try {
-							o = opennet = new OpennetManager(Node.this, opennetCryptoConfig, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
+							o = opennet = new OpennetManager(Node.this, opennetCryptoConfig, eventDispatcher, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
 						} catch (NodeInitException e) {
 							opennet = null;
 							throw new InvalidConfigValueException(e.getMessage());
@@ -1804,7 +1808,7 @@ public class Node implements TimeSkewDetectorCallback {
 		opennetCryptoConfig = new NodeCryptoConfig(opennetConfig, 2 /* 0 = enabled */, true, securityLevels);
 
 		if(opennetEnabled) {
-			opennet = new OpennetManager(this, opennetCryptoConfig, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
+			opennet = new OpennetManager(this, opennetCryptoConfig, eventDispatcher, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
 			// Will be started later
 		} else {
 			opennet = null;
@@ -1832,7 +1836,7 @@ public class Node implements TimeSkewDetectorCallback {
 					synchronized(Node.this) {
 						if(opennet == null) {
 							try {
-								o = opennet = new OpennetManager(Node.this, opennetCryptoConfig, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
+								o = opennet = new OpennetManager(Node.this, opennetCryptoConfig, eventDispatcher, System.currentTimeMillis(), isAllowedToConnectToSeednodes);
 							} catch (NodeInitException e) {
 								opennet = null;
 								Logger.error(this, "UNABLE TO ENABLE OPENNET: "+e, e);
@@ -4126,6 +4130,7 @@ public class Node implements TimeSkewDetectorCallback {
 		}
 
 		config.store();
+		eventDispatcher.unsubscribeAll();
 
         if(random instanceof PersistentRandomSource) {
             ((PersistentRandomSource) random).write_seed(true);
